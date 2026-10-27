@@ -35,6 +35,7 @@ class Context(BaseModel):
 
     source_path: str
     archive_path: str | None
+    dockerignore_path: str | None = None
 
 
 class Image(BaseModel):
@@ -419,13 +420,21 @@ class Image(BaseModel):
                 "strict_context requires context_dir so that the build context boundary is explicit"
             )
 
+        dockerignore_path = str(Path(context_dir) / ".dockerignore") if context_dir else None
+
         for context_path, original_path in Image.__extract_copy_sources(
             "\n".join(dockerfile_commands), context_dir or "", real_root
         ):
             archive_base_path = context_path
             if context_dir and not original_path.startswith(context_dir):
                 archive_base_path = context_path.removeprefix(context_dir)
-            self._context_list.append(Context(source_path=context_path, archive_path=archive_base_path))
+            self._context_list.append(
+                Context(
+                    source_path=context_path,
+                    archive_path=archive_base_path,
+                    dockerignore_path=dockerignore_path,
+                )
+            )
 
         self._dockerfile += "\n".join(dockerfile_commands) + "\n"
 
@@ -433,7 +442,7 @@ class Image(BaseModel):
 
     @staticmethod
     def from_dockerfile(path: str | Path, *, strict_context: bool = False) -> "Image":
-        """Creates an Image from an existing Dockerfile.
+        """Creates an Image from an existing Dockerfile and applies a sibling ``.dockerignore``.
 
         Args:
             path: str | Path: The path to the Dockerfile.
@@ -458,6 +467,7 @@ class Image(BaseModel):
         dockerfile = path.read_text()
         img = Image()
         img._dockerfile = dockerfile
+        dockerignore_path = str(path.parent / ".dockerignore")
 
         # remove dockerfile filename from path
         path_prefix = str(path).removesuffix(path.name)
@@ -467,7 +477,13 @@ class Image(BaseModel):
             archive_base_path = context_path
             if not original_path.startswith(path_prefix):
                 archive_base_path = context_path.removeprefix(path_prefix)
-            img._context_list.append(Context(source_path=context_path, archive_path=archive_base_path))
+            img._context_list.append(
+                Context(
+                    source_path=context_path,
+                    archive_path=archive_base_path,
+                    dockerignore_path=dockerignore_path,
+                )
+            )
 
         return img
 

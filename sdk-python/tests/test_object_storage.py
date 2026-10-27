@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import io
+import tarfile
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -125,8 +127,10 @@ class TestObjectStorage:
         result = storage.upload(str(file_path), "org-1", archive_base_path="custom/base")
 
         assert result == "hash123"
-        storage._compute_hash_for_path_md5.assert_called_once_with(str(file_path), "custom/base")
-        storage._upload_as_tar.assert_called_once_with("org-1/hash123/context.tar", str(file_path), "custom/base")
+        storage._compute_hash_for_path_md5.assert_called_once_with(str(file_path), "custom/base", None)
+        storage._upload_as_tar.assert_called_once_with(
+            "org-1/hash123/context.tar", str(file_path), "custom/base", None
+        )
 
     def test_upload_as_tar_streams_content_to_store(self, tmp_path: Path):
         storage, store = _make_storage()
@@ -146,3 +150,56 @@ class TestObjectStorage:
         assert len(captured["org/hash/context.tar"]) > 0
         assert store.put.call_args.kwargs["max_concurrency"] == 4
         assert store.put.call_args.kwargs["chunk_size"] == 5 * 1024 * 1024
+
+    def test_upload_as_tar_excludes_dockerignore_matches(self, tmp_path: Path):
+        storage, store = _make_storage()
+        context = tmp_path / "env"
+        (context / ".venv/bin").mkdir(parents=True)
+        (context / ".venv/bin/python3").write_text("host interpreter", encoding="utf-8")
+        (context / "app.py").write_text("print('hello')", encoding="utf-8")
+        dockerignore = context / ".dockerignore"
+        dockerignore.write_text(".venv/\n", encoding="utf-8")
+
+        captured: dict[str, bytes] = {}
+
+        def consume_stream(key: str, chunks, **_kwargs):
+            captured[key] = b"".join(chunks)
+
+        store.put.side_effect = consume_stream
+
+        storage._upload_as_tar("org/hash/context.tar", str(context), "env", str(dockerignore))
+
+        with tarfile.open(fileobj=io.BytesIO(captured["org/hash/context.tar"])) as archive:
+            names = archive.getnames()
+        assert "env/app.py" in names
+        assert not any(".venv" in name for name in names)
+
+    def test_ignored_files_do_not_change_context_hash(self, tmp_path: Path):
+        storage, _store = _make_storage()
+        context = tmp_path / "env"
+        (context / ".venv").mkdir(parents=True)
+        ignored_file = context / ".venv/python3"
+        ignored_file.write_text("first", encoding="utf-8")
+        (context / ".dockerignore").write_text(".venv/\n", encoding="utf-8")
+
+        first_hash = storage._compute_hash_for_path_md5(str(context), "env", str(context / ".dockerignore"))
+        ignored_file.write_text("second", encoding="utf-8")
+        second_hash = storage._compute_hash_for_path_md5(str(context), "env", str(context / ".dockerignore"))
+
+        assert first_hash == second_hash
+
+    def test_dockerignore_can_reinclude_a_file_inside_an_ignored_directory(self, tmp_path: Path):
+        from daytona._utils.dockerignore import iter_context_entries
+
+        context = tmp_path / "env"
+        (context / ".venv").mkdir(parents=True)
+        (context / ".venv/python3").write_text("host interpreter", encoding="utf-8")
+        (context / ".venv/keep.txt").write_text("explicitly included", encoding="utf-8")
+        dockerignore = context / ".dockerignore"
+        dockerignore.write_text(".venv/\n!.venv/keep.txt\n", encoding="utf-8")
+
+        entries = list(iter_context_entries(str(context), "env", str(dockerignore)))
+        archive_paths = {archive_path for _source_path, archive_path in entries}
+
+        assert "env/.venv/keep.txt" in archive_paths
+        assert "env/.venv/python3" not in archive_paths

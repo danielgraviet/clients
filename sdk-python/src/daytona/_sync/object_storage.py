@@ -8,9 +8,11 @@ import os
 import tarfile
 import threading
 from datetime import timedelta
+from pathlib import Path
 
 from obstore.store import S3Store
 
+from .._utils.dockerignore import add_context_to_tar, is_ignored, load_spec
 from .._utils.docs_ignore import docs_ignore
 from .._utils.environment import isolated_env
 from .._utils.otel_decorator import with_instrumentation
@@ -67,7 +69,14 @@ class ObjectStorage:
             )
 
     @with_instrumentation()
-    def upload(self, path: str, organization_id: str, archive_base_path: str | None = None) -> str:
+    def upload(
+        self,
+        path: str,
+        organization_id: str,
+        archive_base_path: str | None = None,
+        *,
+        dockerignore_path: str | None = None,
+    ) -> str:
         """Uploads a file to the object storage service.
 
         Args:
@@ -81,7 +90,7 @@ class ObjectStorage:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Path does not exist: {path}")
 
-        path_hash = self._compute_hash_for_path_md5(path, archive_base_path)
+        path_hash = self._compute_hash_for_path_md5(path, archive_base_path, dockerignore_path)
         s3_key = f"{organization_id}/{path_hash}/context.tar"
 
         # Check if it already exists in S3
@@ -89,7 +98,7 @@ class ObjectStorage:
             return path_hash
 
         # Upload to S3
-        self._upload_as_tar(s3_key, path, archive_base_path)
+        self._upload_as_tar(s3_key, path, archive_base_path, dockerignore_path)
 
         return path_hash
 
@@ -111,7 +120,9 @@ class ObjectStorage:
         # Remove leading separators (both / and \)
         return path_without_drive.lstrip("/").lstrip("\\")
 
-    def _compute_hash_for_path_md5(self, path_str: str, archive_base_path: str | None = None) -> str:
+    def _compute_hash_for_path_md5(
+        self, path_str: str, archive_base_path: str | None = None, dockerignore_path: str | None = None
+    ) -> str:
         """Computes the MD5 hash for a given path.
 
         Args:
@@ -128,17 +139,24 @@ class ObjectStorage:
             archive_base_path = self.compute_archive_base_path(path_str)
         md5_hasher.update(archive_base_path.encode("utf-8"))
 
+        spec = load_spec(dockerignore_path)
+        context_root = Path(dockerignore_path).parent if dockerignore_path else Path(abs_path_str)
+
         if os.path.isfile(abs_path_str):
-            with open(abs_path_str, "rb") as f:
-                while chunk := f.read(8192):
-                    md5_hasher.update(chunk)
+            if not is_ignored(Path(abs_path_str), context_root, spec):
+                with open(abs_path_str, "rb") as f:
+                    while chunk := f.read(8192):
+                        md5_hasher.update(chunk)
         else:
             for root, dirs, files in os.walk(abs_path_str):
-                if not dirs and not files:
+                root_path = Path(root)
+                if not dirs and not files and not is_ignored(root_path, context_root, spec, is_dir=True):
                     rel_dir = os.path.relpath(root, path_str)
                     md5_hasher.update(rel_dir.encode("utf-8"))
                 for filename in files:
                     file_path = os.path.join(root, filename)
+                    if is_ignored(Path(file_path), context_root, spec):
+                        continue
                     rel_path = os.path.relpath(file_path, abs_path_str)
 
                     # Incorporate the relative path
@@ -167,7 +185,13 @@ class ObjectStorage:
             return False
         return True
 
-    def _upload_as_tar(self, s3_key: str, source_path: str, archive_base_path: str | None = None) -> None:
+    def _upload_as_tar(
+        self,
+        s3_key: str,
+        source_path: str,
+        archive_base_path: str | None = None,
+        dockerignore_path: str | None = None,
+    ) -> None:
         """Uploads a file to the object storage service as a tar.
 
         Args:
@@ -186,7 +210,10 @@ class ObjectStorage:
 
         def tar_worker():
             with tarfile.open(fileobj=write_file, mode="w|") as tar:
-                tar.add(source_path, arcname=archive_base_path)
+                if dockerignore_path is None:
+                    tar.add(source_path, arcname=archive_base_path)
+                else:
+                    add_context_to_tar(tar, source_path, archive_base_path, dockerignore_path)
             write_file.close()
 
         thread = threading.Thread(target=tar_worker, daemon=True)
