@@ -131,6 +131,9 @@ def _parse(content: str) -> list[_Pattern]:
         line = line.strip()
         if not line:
             continue
+        if os.sep == "\\":
+            # On Windows a backslash is a path separator, never an escape.
+            line = line.replace("\\", "/")
         exclusion = line.startswith("!")
         if exclusion:
             line = line[1:].strip()

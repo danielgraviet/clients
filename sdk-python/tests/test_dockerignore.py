@@ -58,13 +58,28 @@ class TestMatching:
             (".venv\n!.venv/keep.txt", ".venv/bin/python", True),
             ("*.py\n!*.py", "a.py", False),
             ("*.py\n!*.py\n*.py", "a.py", True),
-            # Comments, blank lines, "." and a bare "!" match nothing.
-            ("# a.py\n\n.\n!", "a.py", False),
+            # Comments, blank lines and "." match nothing.
+            ("# a.py\n\n.", "a.py", False),
             ("\ufeffa.py\r\n", "a.py", True),
         ],
     )
     def test_matches_like_docker(self, tmp_path: Path, rules: str, path: str, excluded: bool):
         assert _load(tmp_path, rules).excludes(path) is excluded
+
+    def test_bare_exclamation_mark_is_skipped(self, tmp_path: Path):
+        # Docker fails the build on a bare "!"; the SDK skips that line instead.
+        dockerignore = _load(tmp_path, "!\na.py\n")
+
+        assert dockerignore.excludes("a.py") is True
+        assert dockerignore.excludes("b.py") is False
+
+    def test_backslash_is_a_separator_on_windows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(os, "sep", "\\")
+
+        dockerignore = _load(tmp_path, "build\\out\n")
+
+        assert dockerignore.excludes("build/out/a.o") is True
+        assert dockerignore.excludes("build/keep.txt") is False
 
     def test_context_root_is_never_excluded(self, tmp_path: Path):
         assert _load(tmp_path, "**").excludes(".") is False
