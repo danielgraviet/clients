@@ -8,13 +8,12 @@ import os
 import tarfile
 import threading
 from datetime import timedelta
-from pathlib import Path
 
 import aiofiles
 import aiofiles.os
 from obstore.store import S3Store
 
-from .._utils.dockerignore import add_context_to_tar, is_ignored, load_spec
+from .._utils.dockerignore import DockerIgnore, add_context_to_tar, hash_context_entries
 from .._utils.docs_ignore import docs_ignore
 from .._utils.environment import isolated_env
 from .._utils.otel_decorator import with_instrumentation
@@ -85,6 +84,8 @@ class AsyncObjectStorage:
             path (str): The path to the file to upload.
             organization_id (str): The organization ID to use.
             archive_base_path (str): The base path to use for the archive.
+            dockerignore_path (str | None): The ``.dockerignore`` of the build context the path belongs
+                to. Entries it excludes are left out of the archive and its hash.
 
         Returns:
             str: The hash of the uploaded file.
@@ -130,6 +131,7 @@ class AsyncObjectStorage:
         Args:
             path_str (str): The path to compute the hash for.
             archive_base_path (str): The base path to use for the archive.
+            dockerignore_path (str | None): The ``.dockerignore`` whose exclusions to leave out.
 
         Returns:
             str: The MD5 hash for the given path.
@@ -141,24 +143,24 @@ class AsyncObjectStorage:
             archive_base_path = self.compute_archive_base_path(path_str)
         md5_hasher.update(archive_base_path.encode("utf-8"))
 
-        spec = load_spec(dockerignore_path)
-        context_root = Path(dockerignore_path).parent if dockerignore_path else Path(abs_path_str)
+        dockerignore = await asyncio.to_thread(DockerIgnore.load, dockerignore_path)
+        if dockerignore is not None:
+            await asyncio.to_thread(
+                hash_context_entries, md5_hasher.update, abs_path_str, archive_base_path, dockerignore
+            )
+            return md5_hasher.hexdigest()
 
         if await aiofiles.os.path.isfile(abs_path_str):
-            if not is_ignored(Path(abs_path_str), context_root, spec):
-                async with aiofiles.open(abs_path_str, "rb") as f:
-                    while chunk := await f.read(8192):
-                        md5_hasher.update(chunk)
+            async with aiofiles.open(abs_path_str, "rb") as f:
+                while chunk := await f.read(8192):
+                    md5_hasher.update(chunk)
         else:
             for root, dirs, files in await self._async_os_walk(abs_path_str):
-                root_path = Path(root)
-                if not dirs and not files and not is_ignored(root_path, context_root, spec, is_dir=True):
+                if not dirs and not files:
                     rel_dir = os.path.relpath(root, path_str)
                     md5_hasher.update(rel_dir.encode("utf-8"))
                 for filename in files:
                     file_path = os.path.join(root, filename)
-                    if is_ignored(Path(file_path), context_root, spec):
-                        continue
                     rel_path = os.path.relpath(file_path, abs_path_str)
 
                     # Incorporate the relative path
@@ -200,11 +202,14 @@ class AsyncObjectStorage:
             s3_key (str): The key to upload the file to.
             source_path (str): The path to the file to upload.
             archive_base_path (str | None): The base path to use for the archive.
+            dockerignore_path (str | None): The ``.dockerignore`` whose exclusions to leave out.
         """
         source_path = os.path.normpath(source_path)
 
         if archive_base_path is None:
             archive_base_path = self.compute_archive_base_path(source_path)
+
+        dockerignore = await asyncio.to_thread(DockerIgnore.load, dockerignore_path)
 
         read_fd, write_fd = os.pipe()
         read_file = os.fdopen(read_fd, "rb")
@@ -212,10 +217,10 @@ class AsyncObjectStorage:
 
         def tar_worker():
             with tarfile.open(fileobj=write_file, mode="w|") as tar:
-                if dockerignore_path is None:
+                if dockerignore is None:
                     tar.add(source_path, arcname=archive_base_path)
                 else:
-                    add_context_to_tar(tar, source_path, archive_base_path, dockerignore_path)
+                    add_context_to_tar(tar, source_path, archive_base_path, dockerignore)
             write_file.close()
 
         thread = threading.Thread(target=tar_worker, daemon=True)

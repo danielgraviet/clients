@@ -1097,7 +1097,6 @@ opentelemetry-api = ">=1.27.0,<2.0.0"
 opentelemetry-exporter-otlp-proto-http = ">=1.27.0,<2.0.0"
 opentelemetry-instrumentation-aiohttp-client = ">=0.59b0"
 opentelemetry-sdk = ">=1.27.0,<2.0.0"
-pathspec = ">=1.0.0,<2.0.0"
 pydantic = ">=2.4.2,<3.0.0"
 python-dotenv = ">=1.0.0,<2.0.0"
 python-multipart = ">=0.0.31,<0.1.0"
@@ -3339,7 +3338,7 @@ version = "1.1.1"
 description = "Utility library for gitignore style pattern matching of file paths."
 optional = false
 python-versions = ">=3.9"
-groups = ["main", "dev"]
+groups = ["dev"]
 files = [
     {file = "pathspec-1.1.1-py3-none-any.whl", hash = "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189"},
     {file = "pathspec-1.1.1.tar.gz", hash = "sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a"},
