@@ -6,7 +6,8 @@
 Matching follows Docker's own rules (moby/patternmatcher and the BuildKit context walker), not
 ``.gitignore`` rules: every pattern is anchored at the context root, ``*`` and ``?`` never cross a
 ``/``, ``**`` spans any number of directories, a later ``!`` rule re-includes what an earlier rule
-excluded, and a rule that matches a directory excludes everything below it.
+excluded, and a rule that matches a directory excludes everything below it. A pattern Docker
+rejects fails the upload instead of being skipped.
 """
 
 from __future__ import annotations
@@ -19,10 +20,31 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from enum import Enum
 
+from ..common.errors import DaytonaValidationError
+
 # Regexp metacharacters that have no meaning in a Docker pattern, so they match literally.
 _LITERAL_REGEX_CHARS = frozenset(".+()|{}$")
 # Characters that make a pattern more than a plain path prefix.
 _WILDCARD_CHARS = frozenset("*[]?^\\")
+# Escapes that mean a character class in Go's regexp, and the same thing in Python's with re.ASCII.
+_PERL_CLASS_ESCAPES = frozenset("dDsSwW")
+# POSIX classes Go's regexp accepts in brackets, as Python class ranges.
+_POSIX_CLASSES = {
+    "alnum": "0-9A-Za-z",
+    "alpha": "A-Za-z",
+    "ascii": "\\x00-\\x7f",
+    "blank": "\\t ",
+    "cntrl": "\\x00-\\x1f\\x7f",
+    "digit": "0-9",
+    "graph": "!-~",
+    "lower": "a-z",
+    "print": " -~",
+    "punct": "!-/:-@\\[-`{-~",
+    "space": "\\t\\n\\v\\f\\r ",
+    "upper": "A-Z",
+    "word": "0-9A-Za-z_",
+    "xdigit": "0-9A-Fa-f",
+}
 
 
 class _MatchType(Enum):
@@ -63,8 +85,136 @@ def _clean(pattern: str) -> str:
     return "/" + cleaned.lstrip("/") if cleaned.startswith("//") else cleaned
 
 
-def _compile(cleaned: str, exclusion: bool) -> _Pattern | None:
-    """Translate one pattern into a matcher, or ``None`` if it is not a valid pattern."""
+def _glob_chunks(pattern: str) -> Iterator[str]:
+    """Split a pattern at unbracketed stars, as Go's ``filepath.Match`` scans it."""
+    while pattern:
+        pattern = pattern.lstrip("*")
+        in_range = False
+        index = 0
+        while index < len(pattern):
+            char = pattern[index]
+            if char == "\\":
+                if index + 1 < len(pattern):
+                    index += 1
+            elif char == "[":
+                in_range = True
+            elif char == "]":
+                in_range = False
+            elif char == "*" and not in_range:
+                break
+            index += 1
+        yield pattern[:index]
+        pattern = pattern[index:]
+
+
+def _skip_glob_class_char(chunk: str, index: int) -> int:
+    """Step over one bracket expression character the way Go's ``filepath.Match`` reads it."""
+    if index >= len(chunk) or chunk[index] in "-]":
+        raise ValueError("syntax error in pattern")
+    if chunk[index] == "\\":
+        index += 1
+        if index >= len(chunk):
+            raise ValueError("syntax error in pattern")
+    index += 1
+    if index >= len(chunk):
+        raise ValueError("syntax error in pattern")
+    return index
+
+
+def _check_glob_syntax(pattern: str) -> None:
+    """Reject a pattern that Go's ``filepath.Match`` reports as malformed, as Docker does."""
+    for chunk in _glob_chunks(pattern):
+        index = 0
+        while index < len(chunk):
+            char = chunk[index]
+            index += 1
+            if char == "[":
+                if index < len(chunk) and chunk[index] == "^":
+                    index += 1
+                ranges = 0
+                while not (index < len(chunk) and chunk[index] == "]" and ranges > 0):
+                    index = _skip_glob_class_char(chunk, index)
+                    if chunk[index] == "-":
+                        index = _skip_glob_class_char(chunk, index + 1)
+                    ranges += 1
+                index += 1
+            elif char == "\\":
+                if index >= len(chunk):
+                    raise ValueError("syntax error in pattern")
+                index += 1
+
+
+def _regex_class_char(regex: str, index: int) -> tuple[str, str, int]:
+    """Read one literal character of a Go regexp class as a Python class fragment."""
+    char = regex[index]
+    if char == "\\":
+        if index + 1 >= len(regex):
+            raise ValueError("trailing backslash")
+        char = regex[index + 1]
+        if char.isascii() and char.isalnum():
+            raise ValueError(f"unsupported escape \\{char}")
+        return re.escape(char), char, index + 2
+    return re.escape(char), char, index + 1
+
+
+def _translate_regex_class(regex: str, index: int) -> tuple[str, int]:
+    """Translate a Go regexp bracket expression starting after its ``[``."""
+    translated = "["
+    if index < len(regex) and regex[index] == "^":
+        translated += "^"
+        index += 1
+    first = True
+    while True:
+        if index >= len(regex):
+            raise ValueError("missing closing ]")
+        if regex[index] == "]" and not first:
+            return translated + "]", index + 1
+        first = False
+        if regex.startswith("[:", index) and (end := regex.find(":]", index + 2)) != -1:
+            name = regex[index + 2 : end]
+            if name not in _POSIX_CLASSES:
+                raise ValueError(f"unsupported character class [:{name}:]")
+            translated += _POSIX_CLASSES[name]
+            index = end + 2
+            continue
+        if regex[index] == "\\" and regex[index + 1 : index + 2] in _PERL_CLASS_ESCAPES:
+            translated += regex[index : index + 2]
+            index += 2
+            continue
+        low_fragment, low, index = _regex_class_char(regex, index)
+        if index + 1 < len(regex) and regex[index] == "-" and regex[index + 1] != "]":
+            high_fragment, high, index = _regex_class_char(regex, index + 1)
+            if high < low:
+                raise ValueError("invalid character class range")
+            translated += f"{low_fragment}-{high_fragment}"
+        else:
+            translated += low_fragment
+
+
+def _translate_regex(regex: str) -> str:
+    """Translate the Go regexp Docker builds for a pattern into the Python equivalent."""
+    translated = ""
+    index = 0
+    while index < len(regex):
+        char = regex[index]
+        if char == "[":
+            fragment, index = _translate_regex_class(regex, index + 1)
+            translated += fragment
+        elif char == "\\":
+            escaped = regex[index + 1 : index + 2]
+            if escaped.isascii() and escaped.isalnum() and escaped not in _PERL_CLASS_ESCAPES:
+                raise ValueError(f"unsupported escape \\{escaped}")
+            translated += regex[index : index + 2]
+            index += 2
+        else:
+            translated += char
+            index += 1
+    return translated
+
+
+def _compile(cleaned: str, exclusion: bool) -> _Pattern:
+    """Translate one pattern into a matcher, raising ``ValueError`` if Docker would reject it."""
+    _check_glob_syntax(cleaned)
     regex = "^"
     match_type = _MatchType.EXACT
     position = 0
@@ -113,14 +263,20 @@ def _compile(cleaned: str, exclusion: bool) -> _Pattern | None:
 
     if match_type is not _MatchType.REGEX:
         return _Pattern(cleaned, exclusion, match_type, None)
+    # Docker's regexp is a Go one. Translate it so that it matches the same paths in Python.
     try:
-        return _Pattern(cleaned, exclusion, match_type, re.compile(regex + "$"))
-    except re.error:
-        return None
+        compiled = re.compile(_translate_regex(regex + "$"), re.ASCII)
+    except re.error as error:
+        raise ValueError(str(error)) from error
+    return _Pattern(cleaned, exclusion, match_type, compiled)
 
 
-def _parse(content: str) -> list[_Pattern]:
-    """Parse ``.dockerignore`` content into patterns, in file order."""
+def _parse(content: str, source: str) -> list[_Pattern]:
+    """Parse ``.dockerignore`` content into patterns, in file order.
+
+    Raises:
+        DaytonaValidationError: If a line holds a pattern Docker rejects.
+    """
     patterns: list[_Pattern] = []
     for line_number, raw_line in enumerate(content.split("\n")):
         line = raw_line.removesuffix("\r")
@@ -142,12 +298,14 @@ def _parse(content: str) -> list[_Pattern]:
             # A leading slash is redundant: every pattern is relative to the context root.
             if len(line) > 1 and line.startswith("/"):
                 line = line[1:]
-        if exclusion and not line:
-            # Docker rejects a bare "!"; skip it rather than fail the whole build.
-            continue
-        compiled = _compile(line, exclusion)
-        if compiled is not None:
-            patterns.append(compiled)
+        try:
+            if exclusion and not line:
+                raise ValueError('illegal exclusion pattern: "!"')
+            patterns.append(_compile(line, exclusion))
+        except ValueError as error:
+            raise DaytonaValidationError(
+                f"{source}:{line_number + 1}: invalid pattern {raw_line.strip()!r}: {error}"
+            ) from error
     return patterns
 
 
@@ -175,11 +333,14 @@ class DockerIgnore:
 
         Returns ``None`` when there is no such file or it has no rules, so that callers can keep
         the unfiltered behaviour for contexts without a ``.dockerignore``.
+
+        Raises:
+            DaytonaValidationError: If the file holds a pattern Docker rejects.
         """
         if dockerignore_path is None or not os.path.isfile(dockerignore_path):
             return None
         with open(dockerignore_path, encoding="utf-8", errors="surrogateescape") as dockerignore_file:
-            patterns = _parse(dockerignore_file.read())
+            patterns = _parse(dockerignore_file.read(), dockerignore_path)
         if not patterns:
             return None
         return cls(os.path.dirname(os.path.abspath(dockerignore_path)), tuple(patterns))
@@ -195,24 +356,39 @@ class DockerIgnore:
             return None
         return relative
 
+    def match(self, relative: str, parent: tuple[bool, ...] | None) -> tuple[bool, tuple[bool, ...]]:
+        """Match a context-relative path the way BuildKit does while it walks the context.
+
+        ``parent`` holds, per pattern, whether it matched the parent directory (``None`` for an
+        entry at the context root). Returns whether the path is excluded and the per-pattern results
+        to pass on to its children. A pattern that matched a parent applies to every entry below
+        it, and one skipped at the parent is checked against the entry itself only.
+        """
+        excluded = False
+        results: list[bool] = []
+        for index, pattern in enumerate(self.patterns):
+            matched = parent is not None and parent[index]
+            if not matched:
+                # An exclusion can only change an excluded path, an inclusion an included one.
+                if pattern.exclusion != excluded:
+                    results.append(False)
+                    continue
+                matched = pattern.match(relative)
+            results.append(matched)
+            if matched:
+                excluded = not pattern.exclusion
+        return excluded, tuple(results)
+
     def excludes(self, relative: str) -> bool:
-        """Whether a context-relative path is excluded, directly or through a parent directory."""
+        """Whether a context-relative path is excluded, given the directories above it."""
         if relative == ".":
             # Docker never excludes the context root itself.
             return False
-        parent = posixpath.dirname(relative)
-        parent_dirs = parent.split("/") if parent else []
-        matched = False
-        for pattern in self.patterns:
-            # An exclusion can only change an already matched path, an inclusion an unmatched one.
-            if pattern.exclusion != matched:
-                continue
-            match = pattern.match(relative) or any(
-                pattern.match("/".join(parent_dirs[: depth + 1])) for depth in range(len(parent_dirs))
-            )
-            if match:
-                matched = not pattern.exclusion
-        return matched
+        parts = relative.split("/")
+        parent = None
+        for depth in range(1, len(parts)):
+            _, parent = self.match("/".join(parts[:depth]), parent)
+        return self.match(relative, parent)[0]
 
     def may_include_below(self, relative_dir: str) -> bool:
         """Whether a later ``!`` rule could re-include something inside an excluded directory."""
@@ -245,12 +421,17 @@ def _walk(
     local_path: str,
     archive_path: str,
     relative: str | None,
+    parent: tuple[bool, ...] | None,
     dockerignore: DockerIgnore,
     pending: list[_PendingDir],
 ) -> Iterator[tuple[str, str]]:
     is_dir = _is_real_dir(local_path)
-    if relative is not None and dockerignore.excludes(relative):
-        if not is_dir or not dockerignore.may_include_below(relative):
+    excluded = False
+    results = None
+    if relative is not None and relative != ".":
+        excluded, results = dockerignore.match(relative, parent)
+    if excluded:
+        if not is_dir or not dockerignore.may_include_below(relative or ""):
             return
         pending = [*pending, _PendingDir(local_path, archive_path)]
     else:
@@ -270,6 +451,7 @@ def _walk(
             os.path.join(local_path, name),
             posixpath.join(archive_path, name),
             child_relative,
+            results,
             dockerignore,
             pending,
         )
@@ -283,7 +465,17 @@ def iter_context_entries(
     Entries come in the order ``tarfile`` adds them. Symlinks are kept as links and never
     followed, and a source outside the context root is not filtered at all.
     """
-    yield from _walk(source_path, archive_base_path, dockerignore.relative(source_path), dockerignore, [])
+    relative = dockerignore.relative(source_path)
+    parent = None
+    if relative is not None and relative != ".":
+        # Match the directories above the source as BuildKit's walk from the context root would.
+        parts = relative.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = "/".join(parts[:depth])
+            excluded, parent = dockerignore.match(ancestor, parent)
+            if excluded and not dockerignore.may_include_below(ancestor):
+                return
+    yield from _walk(source_path, archive_base_path, relative, parent, dockerignore, [])
 
 
 def add_context_to_tar(

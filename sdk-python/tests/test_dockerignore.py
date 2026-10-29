@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from daytona._utils.dockerignore import DockerIgnore, iter_context_entries
+from daytona.common.errors import DaytonaValidationError
 
 
 def _load(tmp_path: Path, rules: str) -> DockerIgnore:
@@ -58,6 +59,23 @@ class TestMatching:
             (".venv\n!.venv/keep.txt", ".venv/bin/python", True),
             ("*.py\n!*.py", "a.py", False),
             ("*.py\n!*.py\n*.py", "a.py", True),
+            # A rule skipped for a parent directory is not checked against that parent again, so
+            # repeating an exclusion after an exception does not re-exclude what is inside it.
+            ("d\n!d/keep\nd", "d/keep", False),
+            ("d\n!d/keep\nd", "d/other", True),
+            ("d\n!d/keep\n**/d", "d/keep", False),
+            ("node_modules\n!node_modules/local\n**/node_modules", "node_modules/local/index.js", False),
+            ("node_modules\n!node_modules/local\n**/node_modules", "src/node_modules/index.js", True),
+            ("d\n!d/sub\nd/sub/keep", "d/sub/keep", True),
+            ("d\n!d/sub\nd/sub/keep", "d/sub/other", False),
+            # Bracket expressions follow Go's regexp, POSIX classes included.
+            ("[[:alpha:]]*", "app.py", True),
+            ("[[:alpha:]]*", "9.txt", False),
+            ("[[:digit:][:upper:]]*", "Upper.txt", True),
+            ("[^a-m]*", "zeta", True),
+            ("[^a-m]*", "alpha", False),
+            ("[!a]*", "!x", True),
+            ("\\d*", "9.txt", True),
             # Comments, blank lines and "." match nothing.
             ("# a.py\n\n.", "a.py", False),
             ("\ufeffa.py\r\n", "a.py", True),
@@ -66,12 +84,17 @@ class TestMatching:
     def test_matches_like_docker(self, tmp_path: Path, rules: str, path: str, excluded: bool):
         assert _load(tmp_path, rules).excludes(path) is excluded
 
-    def test_bare_exclamation_mark_is_skipped(self, tmp_path: Path):
-        # Docker fails the build on a bare "!"; the SDK skips that line instead.
-        dockerignore = _load(tmp_path, "!\na.py\n")
+    # Docker fails the build on each of these, so uploading the rest would fail open.
+    @pytest.mark.parametrize(
+        "rule",
+        ["[", "!", "abc\\", "[]a]", "[-a]", "[a-]", "[z-a]", "[[:foo:]]", "[[:^alpha:]]"],
+    )
+    def test_invalid_pattern_raises(self, tmp_path: Path, rule: str):
+        dockerignore_path = tmp_path / ".dockerignore"
+        dockerignore_path.write_text(f"*.log\n{rule}\n", encoding="utf-8")
 
-        assert dockerignore.excludes("a.py") is True
-        assert dockerignore.excludes("b.py") is False
+        with pytest.raises(DaytonaValidationError, match=rf"\.dockerignore:2: invalid pattern"):
+            _ = DockerIgnore.load(str(dockerignore_path))
 
     def test_backslash_is_a_separator_on_windows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(os, "sep", "\\")
@@ -141,6 +164,17 @@ class TestContextEntries:
 
         assert _archive_paths(tmp_path / ".venv", dockerignore) == []
         assert _archive_paths(tmp_path / ".venv/bin/python3", dockerignore) == []
+
+    def test_nested_source_uses_the_rules_of_its_parent_directories(self, tmp_path: Path):
+        (tmp_path / "d/sub").mkdir(parents=True)
+        (tmp_path / "d/keep").write_text("keep", encoding="utf-8")
+        (tmp_path / "d/other").write_text("other", encoding="utf-8")
+        (tmp_path / "d/sub/keep").write_text("keep", encoding="utf-8")
+        reapplied = _load(tmp_path, "d\n!d/keep\nd\n")
+
+        assert _archive_paths(tmp_path / "d", reapplied) == ["ctx", "ctx/keep"]
+        assert _archive_paths(tmp_path / "d/keep", reapplied) == ["ctx"]
+        assert _archive_paths(tmp_path / "d/sub/keep", _load(tmp_path, "d\n")) == []
 
     def test_excluded_directory_is_not_walked_without_exceptions(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         (tmp_path / "node_modules/pkg").mkdir(parents=True)
