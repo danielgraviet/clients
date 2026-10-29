@@ -76,6 +76,22 @@ class TestMatching:
             ("[^a-m]*", "alpha", False),
             ("[!a]*", "!x", True),
             ("\\d*", "9.txt", True),
+            # Go regexp escapes, alternation and repetition reach Docker's regexp as they are.
+            ("\\x41*", "A1", True),
+            ("\\x{55}*", "Upper.txt", True),
+            ("\\101*", "A1", True),
+            ("tab\\tx", "tab\tx", True),
+            ("[\\x41-\\x5a]*", "Upper.txt", True),
+            ("\\Qa\\E.py", "a.py", True),
+            ("a|U*", "app.py", True),
+            ("a|U*", "Upper.txt", True),
+            ("a|U*", "b.py", False),
+            ("*.p{1}y", "a.py", True),
+            ("x{,2}*", "x{,2}z", True),
+            ("*.{py,txt}", "a.{py,txt}", True),
+            ("*.{py,txt}", "a.py", False),
+            ("Up$*", "Up$1", True),
+            ("Up$*", "Up", False),
             # Comments, blank lines and "." match nothing.
             ("# a.py\n\n.", "a.py", False),
             ("\ufeffa.py\r\n", "a.py", True),
@@ -87,13 +103,35 @@ class TestMatching:
     # Docker fails the build on each of these, so uploading the rest would fail open.
     @pytest.mark.parametrize(
         "rule",
-        ["[", "!", "abc\\", "[]a]", "[-a]", "[a-]", "[z-a]", "[[:foo:]]", "[[:^alpha:]]"],
+        [
+            "[",
+            "!",
+            "abc\\",
+            "[]a]",
+            "[-a]",
+            "[a-]",
+            "[z-a]",
+            "[[:foo:]]",
+            "[[:^alpha:]]",
+            "a{1001}*",
+            "b{2,1}*",
+            "*{2}",
+            "\\1a",
+        ],
     )
     def test_invalid_pattern_raises(self, tmp_path: Path, rule: str):
         dockerignore_path = tmp_path / ".dockerignore"
         dockerignore_path.write_text(f"*.log\n{rule}\n", encoding="utf-8")
 
         with pytest.raises(DaytonaValidationError, match=rf"\.dockerignore:2: invalid pattern"):
+            _ = DockerIgnore.load(str(dockerignore_path))
+
+    def test_unicode_class_is_unsupported(self, tmp_path: Path):
+        # Docker accepts \p{Lu}, but Python's re module has no Unicode classes.
+        dockerignore_path = tmp_path / ".dockerignore"
+        dockerignore_path.write_text("\\p{Lu}*\n", encoding="utf-8")
+
+        with pytest.raises(DaytonaValidationError, match=r"unsupported escape \\p"):
             _ = DockerIgnore.load(str(dockerignore_path))
 
     def test_backslash_is_a_separator_on_windows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

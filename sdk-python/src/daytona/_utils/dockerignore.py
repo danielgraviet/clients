@@ -8,6 +8,10 @@ Matching follows Docker's own rules (moby/patternmatcher and the BuildKit contex
 ``/``, ``**`` spans any number of directories, a later ``!`` rule re-includes what an earlier rule
 excluded, and a rule that matches a directory excludes everything below it. A pattern Docker
 rejects fails the upload instead of being skipped.
+
+Docker turns a pattern into a Go regexp, and some regexp syntax reaches it unescaped: brackets,
+escapes, ``|``, ``{n,m}`` and ``^``. That is translated to the Python equivalent. Unicode classes
+(``\\p``) have no equivalent in Python's ``re`` module, so a pattern using one fails the upload.
 """
 
 from __future__ import annotations
@@ -22,8 +26,13 @@ from enum import Enum
 
 from ..common.errors import DaytonaValidationError
 
-# Regexp metacharacters that have no meaning in a Docker pattern, so they match literally.
-_LITERAL_REGEX_CHARS = frozenset(".+()|{}$")
+# Regexp metacharacters Docker escapes so that they match literally. Its escape table is meant to
+# cover "{", "|" and "}" too but overflows for them, so those reach the regexp unescaped.
+_LITERAL_REGEX_CHARS = frozenset(".+()$")
+# A Go regexp repetition; any other "{" is a literal.
+_REPEAT = re.compile(r"\{([0-9]+)(,([0-9]*))?\}")
+# Go's limit on repetition counts.
+_MAX_REPEAT = 1000
 # Characters that make a pattern more than a plain path prefix.
 _WILDCARD_CHARS = frozenset("*[]?^\\")
 # Escapes that mean a character class in Go's regexp, and the same thing in Python's with re.ASCII.
@@ -71,8 +80,8 @@ class _Pattern:
             return path.endswith(suffix) or (suffix.startswith("/") and path == suffix[1:])
         if self.regex is None:
             return False
-        found = self.regex.match(path)
-        return found is not None and found.end() == len(path)
+        # Like Go's MatchString, the regexp may match anywhere; its own anchors decide.
+        return self.regex.search(path) is not None
 
     def without_trailing_glob(self) -> str:
         return self.cleaned.removesuffix("/**").removesuffix("/*")
@@ -144,17 +153,58 @@ def _check_glob_syntax(pattern: str) -> None:
                 index += 1
 
 
+_CONTROL_ESCAPES = {"a": "\a", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+# Go's assertions, as Python spells them. Go's \z is Python's \Z.
+_ASSERTION_ESCAPES = {"A": "\\A", "b": "\\b", "B": "\\B", "z": "\\Z"}
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_OCTAL_DIGITS = frozenset("01234567")
+
+
+def _escaped_char(regex: str, index: int) -> tuple[str, int] | None:
+    """Read the character a Go regexp escape at ``regex[index]`` stands for.
+
+    Returns ``None`` for an escape that is not a single character, such as a class or assertion.
+    """
+    if index + 1 >= len(regex):
+        raise ValueError("trailing backslash")
+    char = regex[index + 1]
+    if char in _CONTROL_ESCAPES:
+        return _CONTROL_ESCAPES[char], index + 2
+    if char == "x":
+        if regex[index + 2 : index + 3] == "{":
+            end = regex.find("}", index + 3)
+            digits = regex[index + 3 : end] if end != -1 else ""
+            if not digits or not _HEX_DIGITS.issuperset(digits) or int(digits, 16) > 0x10FFFF:
+                raise ValueError("invalid escape \\x{...}")
+            return chr(int(digits, 16)), end + 1
+        digits = regex[index + 2 : index + 4]
+        if len(digits) != 2 or not _HEX_DIGITS.issuperset(digits):
+            raise ValueError("invalid escape \\x")
+        return chr(int(digits, 16)), index + 4
+    if char in _OCTAL_DIGITS:
+        # A single non-zero digit would be a backreference, which Go does not support.
+        end = index + 2
+        while end < index + 4 and regex[end : end + 1] in _OCTAL_DIGITS and regex[end : end + 1]:
+            end += 1
+        if char != "0" and end == index + 2:
+            raise ValueError(f"invalid escape \\{char}")
+        return chr(int(regex[index + 1 : end], 8)), end
+    if char in _PERL_CLASS_ESCAPES or (char.isascii() and char.isalnum()):
+        return None
+    if not char.isascii():
+        raise ValueError(f"invalid escape \\{char}")
+    return char, index + 2
+
+
 def _regex_class_char(regex: str, index: int) -> tuple[str, str, int]:
     """Read one literal character of a Go regexp class as a Python class fragment."""
-    char = regex[index]
-    if char == "\\":
-        if index + 1 >= len(regex):
-            raise ValueError("trailing backslash")
-        char = regex[index + 1]
-        if char.isascii() and char.isalnum():
-            raise ValueError(f"unsupported escape \\{char}")
-        return re.escape(char), char, index + 2
-    return re.escape(char), char, index + 1
+    if regex[index] != "\\":
+        return re.escape(regex[index]), regex[index], index + 1
+    escaped = _escaped_char(regex, index)
+    if escaped is None:
+        raise ValueError(f"unsupported escape \\{regex[index + 1]} in a character class")
+    char, index = escaped
+    return re.escape(char), char, index
 
 
 def _translate_regex_class(regex: str, index: int) -> tuple[str, int]:
@@ -191,6 +241,26 @@ def _translate_regex_class(regex: str, index: int) -> tuple[str, int]:
             translated += low_fragment
 
 
+def _translate_escape(regex: str, index: int) -> tuple[str, int]:
+    """Translate a Go regexp escape outside a character class."""
+    escaped = _escaped_char(regex, index)
+    if escaped is not None:
+        char, index = escaped
+        return re.escape(char), index
+    char = regex[index + 1]
+    if char in _PERL_CLASS_ESCAPES:
+        return regex[index : index + 2], index + 2
+    if char in _ASSERTION_ESCAPES:
+        return _ASSERTION_ESCAPES[char], index + 2
+    if char == "Q":
+        # Everything up to \E, or the end, is literal text.
+        end = regex.find("\\E", index + 2)
+        literal = regex[index + 2 :] if end == -1 else regex[index + 2 : end]
+        return re.escape(literal), len(regex) if end == -1 else end + 2
+    # Unicode classes (\p, \P) have no equivalent in Python's re module.
+    raise ValueError(f"unsupported escape \\{char}")
+
+
 def _translate_regex(regex: str) -> str:
     """Translate the Go regexp Docker builds for a pattern into the Python equivalent."""
     translated = ""
@@ -201,11 +271,24 @@ def _translate_regex(regex: str) -> str:
             fragment, index = _translate_regex_class(regex, index + 1)
             translated += fragment
         elif char == "\\":
-            escaped = regex[index + 1 : index + 2]
-            if escaped.isascii() and escaped.isalnum() and escaped not in _PERL_CLASS_ESCAPES:
-                raise ValueError(f"unsupported escape \\{escaped}")
-            translated += regex[index : index + 2]
-            index += 2
+            fragment, index = _translate_escape(regex, index)
+            translated += fragment
+        elif char == "{":
+            repeat = _REPEAT.match(regex, index)
+            if repeat is None:
+                translated += "\\{"
+                index += 1
+                continue
+            low = int(repeat.group(1))
+            high = None if not repeat.group(3) else int(repeat.group(3))
+            if low > _MAX_REPEAT or (high is not None and (high > _MAX_REPEAT or high < low)):
+                raise ValueError(f"invalid repeat count {repeat.group(0)}")
+            translated += repeat.group(0)
+            index = repeat.end()
+        elif char == "$":
+            # Go's "$" only matches at the very end, Python's also before a final newline.
+            translated += "\\Z"
+            index += 1
         else:
             translated += char
             index += 1
